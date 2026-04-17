@@ -19,7 +19,7 @@
 | 비교 | 기존 (claude-code) | 변경 (claude-agent-sdk) |
 |------|-------------------|----------------------|
 | 호출 방식 | `claude({ prompt })` 단발 호출 | `query({ prompt, options })` 스트리밍 |
-| 결과 수신 | HTTP 폴링 (2초 간격) | WebSocket 실시간 스트리밍 |
+| 결과 수신 | HTTP 폴링 (2초 간격) | SSE(Server-Sent Events) 실시간 스트리밍 |
 | 대화 | 단발성 (1회 prompt → 1회 diff) | 멀티턴 (후속 메시지로 보완/수정) |
 | 세션 | 없음 | 세션 생성/재개/목록 조회 |
 | 중간 과정 | 보이지 않음 | 도구 사용, 파일 읽기/수정 실시간 표시 |
@@ -45,17 +45,20 @@
 
 ```mermaid
 graph TD
-    Client["Web UI<br/>Next.js :3000"] -->|WebSocket| API["API Server<br/>Express :3001"]
+    Client["Web UI<br/>Next.js :3000"] -->|GET /edits/:id/events (SSE)| API["API Server<br/>Fastify :3001"]
     API -->|subprocess| SDK["Claude Agent SDK<br/>AsyncGenerator"]
     SDK -->|도구 실행| FS["projects/working/<br/>(파일 읽기/수정)"]
 
     SDK -->|SDKMessage 스트림| API
-    API -->|Socket.IO emit| Client
+    API -->|fastify-sse-v2 (SSE frame)| Client
 
-    Client -->|"edit:send_message"| API
-    Client -->|"edit:interrupt"| API
+    Client -->|"POST /edits/:id/messages"| API
+    Client -->|"POST /edits/:id/interrupt"| API
+    Client -->|"POST /edits/:id/rewind"| API
+    Client -->|"POST /edits/:id/end"| API
     API -->|"sendFollowUp()"| SDK
     API -->|"interrupt()"| SDK
+    API -->|"rewindFiles()"| SDK
 
     subgraph 보안 경계
         FS
@@ -75,36 +78,36 @@ sequenceDiagram
     사용자->>UI: 수정 요청 입력
     UI->>API: POST /projects/:id/edits (prompt)
     API->>API: Edit(STREAMING) 생성
-    API-->>UI: editId + wsUrl (202)
+    API-->>UI: editId + eventsUrl (202)
 
-    UI->>API: WebSocket 연결 (ws://host/ws/edits/:editId)
+    UI->>API: GET /edits/:editId/events (SSE 연결)
     API->>SDK: query({ prompt, options })
 
     loop AsyncGenerator 소비
         SDK->>FS: 파일 읽기 (Read 도구)
         SDK-->>API: SDKMessage (tool_use)
-        API-->>UI: edit:tool_start { tool: "Read", input: { path: "..." } }
+        API-->>UI: SSE event edit:tool_start { tool: "Read", input: { path: "..." } }
 
         SDK-->>API: SDKMessage (assistant text)
-        API-->>UI: edit:text_delta { delta: "분석 결과..." }
+        API-->>UI: SSE event edit:text_delta { delta: "분석 결과..." }
 
         SDK->>FS: 파일 수정 (Edit 도구)
         SDK-->>API: SDKMessage (tool_use)
-        API-->>UI: edit:tool_start { tool: "Edit", input: { file_path: "..." } }
-        API-->>UI: edit:file_change { path: "tests/login.spec.ts", type: "edit" }
+        API-->>UI: SSE event edit:tool_start { tool: "Edit", input: { file_path: "..." } }
+        API-->>UI: SSE event edit:file_change { path: "tests/login.spec.ts", type: "edit" }
     end
 
     SDK-->>API: SDKMessage (turn_complete)
-    API-->>UI: edit:turn_complete { messageId, filesChanged }
+    API-->>UI: SSE event edit:turn_complete { messageId, filesChanged }
     API->>API: Edit status → WAITING_INPUT
 
     alt 후속 메시지
         사용자->>UI: 후속 요청 입력
-        UI->>API: edit:send_message { message: "..." }
+        UI->>API: POST /edits/:editId/messages { message }
         API->>SDK: sendFollowUp(message)
         Note over SDK,FS: 추가 수정 진행...
         SDK-->>API: SDKMessage (turn_complete)
-        API-->>UI: edit:turn_complete
+        API-->>UI: SSE event edit:turn_complete
     end
 
     alt 승인
@@ -177,8 +180,8 @@ sequenceDiagram
 
 SDK의 AsyncGenerator가 yield하는 메시지 타입들:
 
-| 타입 | 설명 | WebSocket 변환 |
-|------|------|---------------|
+| 타입 | 설명 | SSE 이벤트 변환 |
+|------|------|----------------|
 | `assistant` | Claude 응답 (텍스트 + tool_use 블록) | `edit:text_done`, `edit:tool_start` |
 | `stream_event` | 실시간 부분 콘텐츠 | `edit:text_delta` |
 | `result` | 최종 결과 (비용, 사용량, 소요시간) | `edit:result` |
@@ -250,9 +253,9 @@ SDK의 AsyncGenerator가 yield하는 메시지 타입들:
 
 #### `POST /projects/:id/edits` → 202
 
-수정 세션 시작. 기존 동작과 동일하되 `wsUrl` 추가 반환.
+수정 세션 시작. SSE 구독용 `eventsUrl`을 반환.
 
-> **구현 참고**: `prompt`를 받아 Edit을 STREAMING 상태로 생성하고 `editId`, `status`, `wsUrl`을 응답한다.
+> **구현 참고**: `prompt`를 받아 Edit을 STREAMING 상태로 생성하고 `editId`, `status`, `eventsUrl`(예: `/api/v1/edits/{editId}/events`)을 응답한다.
 
 #### `GET /edits/:editId` → 200
 
@@ -270,7 +273,14 @@ SDK 세션 목록 조회. 세션 재개 시 사용.
 
 이전 세션 재개.
 
-> **구현 참고**: `sessionId`와 후속 `prompt`를 받아 해당 세션을 재개하고 `editId`, `status: STREAMING`, `wsUrl`을 응답한다.
+> **구현 참고**: `sessionId`와 후속 `prompt`를 받아 해당 세션을 재개하고 `editId`, `status: STREAMING`, `eventsUrl`을 응답한다.
+
+#### 제어용 REST 엔드포인트 (SSE 단방향 전환에 따른 신규)
+
+- `POST /edits/:editId/messages` → 202 (`{ message }`) — 후속 메시지 전송. 기존 `edit:send_message` 이벤트를 대체한다.
+- `POST /edits/:editId/interrupt` → 202 (바디 없음) — 진행 중 세션 중단. 기존 `edit:interrupt` 이벤트를 대체한다.
+- `POST /edits/:editId/rewind` → 200 (`{ messageId, dryRun? }`) — 파일 변경 되돌리기. 기존 `edit:rewind` 이벤트를 대체한다.
+- `POST /edits/:editId/end` → 200 (바디 없음) — 대화 종료(PENDING 전환).
 
 #### 기존 엔드포인트 (변경 없음)
 
@@ -278,19 +288,30 @@ SDK 세션 목록 조회. 세션 재개 시 사용.
 - `POST /edits/:editId/reject` → 200 (거부)
 - `GET /projects/:id/edits` → 200 (이력 조회)
 
-### 5.2 WebSocket 엔드포인트
+### 5.2 SSE 엔드포인트
 
-#### `ws://host/ws/edits/:editId`
+#### `GET /edits/:editId/events`
 
-수정 세션의 실시간 스트리밍.
+수정 세션의 실시간 SSE 스트림.
 
-**연결 시**: JWT 인증 + 조직 권한 확인 (기존 `runSocket.ts`와 동일 패턴)
+**구현**: Fastify + `fastify-sse-v2` 플러그인. 프레임 형식:
+
+```
+event: <edit:*>
+id: <monotonic-id>
+data: <JSON payload>
+
+```
+
+**연결 시**: JWT 인증(쿼리 `?token=` 또는 `Authorization` 헤더) + 조직 권한 확인 (`runSse.ts`와 동일 패턴). `Last-Event-ID` 헤더가 있으면 해당 시점 이후만 리플레이(Phase 2+).
 
 ---
 
-## 6. WebSocket 이벤트 설계
+## 6. SSE 이벤트 설계
 
-### 6.1 Server → Client 이벤트
+### 6.1 Server → Client 이벤트 (SSE)
+
+아래 이벤트 이름들은 SSE 프레임의 `event:` 라인 값으로 사용되며, `data:` 라인은 각 페이로드의 JSON 문자열이다.
 
 | 이벤트 | 설명 | 데이터 |
 |--------|------|--------|
@@ -305,37 +326,72 @@ SDK 세션 목록 조회. 세션 재개 시 사용.
 | `edit:result` | 세션 최종 결과 | `{ subtype, costUsd, durationMs, totalTurns, usage }` |
 | `edit:error` | 에러 발생 | `{ code: string, message: string }` |
 
-### 6.2 Client → Server 이벤트
+### 6.2 Client → Server 조작 (REST)
 
-| 이벤트 | 설명 | 데이터 |
-|--------|------|--------|
-| `edit:send_message` | 후속 메시지 전송 | `{ message: string }` |
-| `edit:interrupt` | 현재 작업 중단 | `{}` |
-| `edit:rewind` | 파일 변경 되돌리기 | `{ messageId: string, dryRun?: boolean }` |
+SSE는 단방향이므로 기존 WebSocket inbound 이벤트는 모두 REST 엔드포인트로 대체된다.
 
-### 6.3 이벤트 흐름 예시
+| 기존 WS 이벤트 | 교체 엔드포인트 | 바디 |
+|----------------|----------------|------|
+| `edit:send_message` | `POST /edits/:editId/messages` | `{ message: string }` |
+| `edit:interrupt` | `POST /edits/:editId/interrupt` | `{}` |
+| `edit:rewind` | `POST /edits/:editId/rewind` | `{ messageId: string, dryRun?: boolean }` |
+| (신규) | `POST /edits/:editId/end` | `{}` — 대화 종료(PENDING 전환) |
+
+엔드포인트 성공 응답 후 후속 스트리밍은 기존 SSE 연결을 통해 그대로 전달된다.
+
+### 6.3 이벤트 흐름 예시 (SSE 프레임)
 
 ```
-[연결]    → edit:connected { sessionId: "abc-123", tools: ["Read","Edit",...] }
+[연결 확인] GET /edits/abc/events
+           event: edit:connected
+           id: 1
+           data: {"sessionId":"abc-123","tools":["Read","Edit"],"model":"claude-..."}
 
-[스트리밍] → edit:tool_start { tool: "Read", input: { file_path: "tests/login.spec.ts" } }
-           → edit:tool_result { output: "// file content...", isError: false }
-           → edit:text_delta { delta: "분석" }
-           → edit:text_delta { delta: "해보니" }
-           → edit:text_delta { delta: " password 입력 후에" }
-           → edit:tool_start { tool: "Edit", input: { file_path: "tests/login.spec.ts", ... } }
-           → edit:file_change { path: "tests/login.spec.ts", type: "edit" }
-           → edit:tool_result { output: "File edited successfully", isError: false }
-           → edit:text_done { text: "수정을 완료했습니다. waitForTimeout(1000)을 추가했습니다." }
-           → edit:turn_complete { messageId: "msg-001", filesChanged: ["tests/login.spec.ts"] }
+[스트리밍] event: edit:tool_start
+           id: 2
+           data: {"tool":"Read","input":{"file_path":"tests/login.spec.ts"}}
 
-[후속]     ← edit:send_message { message: "대기 시간을 2초로 변경해줘" }
-           → edit:tool_start { tool: "Edit", ... }
-           → edit:file_change { ... }
-           → edit:text_done { text: "2초로 변경했습니다." }
-           → edit:turn_complete { messageId: "msg-002", filesChanged: [...] }
+           event: edit:tool_result
+           id: 3
+           data: {"toolUseId":"...","output":"// file content...","isError":false}
 
-[결과]     → edit:result { subtype: "success", costUsd: 0.05, durationMs: 12000, totalTurns: 3 }
+           event: edit:text_delta
+           id: 4
+           data: {"delta":"분석"}
+
+           event: edit:text_delta
+           id: 5
+           data: {"delta":"해보니"}
+
+           event: edit:tool_start
+           id: 6
+           data: {"tool":"Edit","input":{"file_path":"tests/login.spec.ts",...}}
+
+           event: edit:file_change
+           id: 7
+           data: {"path":"tests/login.spec.ts","type":"edit"}
+
+           event: edit:text_done
+           id: 8
+           data: {"text":"수정을 완료했습니다. waitForTimeout(1000)을 추가했습니다."}
+
+           event: edit:turn_complete
+           id: 9
+           data: {"messageId":"msg-001","filesChanged":["tests/login.spec.ts"]}
+
+[후속 요청] POST /edits/abc/messages { "message": "대기 시간을 2초로 변경해줘" }
+
+           event: edit:tool_start
+           ...
+           event: edit:turn_complete
+           id: 14
+           data: {"messageId":"msg-002","filesChanged":[...]}
+
+[종료 요청] POST /edits/abc/end
+
+           event: edit:result
+           id: 15
+           data: {"subtype":"success","costUsd":0.05,"durationMs":12000,"totalTurns":3}
 ```
 
 ---
@@ -435,7 +491,7 @@ stateDiagram-v2
 #### `EditChatView.tsx` — 메인 채팅 컨테이너
 
 - Props: `editId: string`
-- `useEditSocket(editId)` 훅으로 WebSocket 연결
+- `useEditEvents(editId)` 훅으로 SSE(EventSource) 구독
 - 메시지 목록 렌더링 (user + assistant + tool activity)
 - 자동 스크롤 (새 메시지 도착 시)
 - 스트리밍 텍스트 실시간 표시
@@ -464,10 +520,10 @@ stateDiagram-v2
 
 #### `SessionControls.tsx` — 세션 제어
 
-- "중단" 버튼: `STREAMING` 상태에서만 활성화, `edit:interrupt` 이벤트 전송
-- "되돌리기" 버튼: 메시지 시점 선택 → `edit:rewind` 이벤트 전송
-- "대화 종료" 버튼: `WAITING_INPUT` 상태에서 대화 종료 → `REVIEWING` 전환
-- "승인" / "거부" 버튼: `REVIEWING` 상태에서 활성화
+- "중단" 버튼: `STREAMING` 상태에서만 활성화, `POST /edits/:editId/interrupt` 호출
+- "되돌리기" 버튼: 메시지 시점 선택 → `POST /edits/:editId/rewind { messageId, dryRun }` 호출
+- "대화 종료" 버튼: `WAITING_INPUT` 상태에서 `POST /edits/:editId/end` → `REVIEWING` 전환
+- "승인" / "거부" 버튼: `REVIEWING` 상태에서 `POST /edits/:editId/approve` 또는 `/reject`
 
 #### `FileChangeTracker.tsx` — 변경 파일 추적
 
@@ -476,9 +532,9 @@ stateDiagram-v2
 - 각 파일 클릭 시 DiffViewer 모달 오픈
 - `edit:file_change` 이벤트로 실시간 업데이트
 
-### 8.4 WebSocket 훅
+### 8.4 SSE 훅
 
-> **구현 참고**: `apps/web/lib/ws-edit.ts`의 `useEditSocket(editId)` 훅은 editId가 있을 때 JWT를 실어 Socket.IO 연결을 맺고 다음 상태를 관리한다 — `messages`, `currentStream`, `status`(idle/streaming/waiting_input/reviewing/error), `filesChanged`, `activeTools`, `sessionInfo`, `isConnected`. 서버 이벤트 핸들러는 `edit:connected` → sessionInfo 저장 + status streaming, `edit:text_delta` → currentStream 누적, `edit:text_done` → messages에 assistant 메시지 추가 + currentStream 초기화, `edit:tool_start`/`edit:tool_result` → activeTools 갱신, `edit:file_change` → filesChanged 중복 없이 추가, `edit:turn_complete` → status waiting_input, `edit:result` → status reviewing, `edit:error` → status error. 반환 API는 `sendMessage(msg)`(user 메시지 추가 후 `edit:send_message` emit), `interrupt()`(`edit:interrupt` emit), `rewind(messageId, dryRun)`(`edit:rewind` emit)이며 언마운트 시 소켓을 disconnect 한다.
+> **구현 참고**: `apps/web/lib/sse-edit.ts`의 `useEditEvents(editId)` 훅은 editId가 있을 때 브라우저 native `EventSource`로 `GET /api/v1/edits/:editId/events?token=${jwt}`에 연결하고 다음 상태를 관리한다 — `messages`, `currentStream`, `status`(idle/streaming/waiting_input/reviewing/error), `filesChanged`, `activeTools`, `sessionInfo`, `isConnected`, `lastEventId`(재연결용). 이벤트 핸들러는 `EventSource.addEventListener('edit:connected', ...)` 형태로 등록하며 — `edit:connected` → sessionInfo 저장 + status streaming, `edit:text_delta` → currentStream 누적, `edit:text_done` → messages에 assistant 메시지 추가 + currentStream 초기화, `edit:tool_start`/`edit:tool_result` → activeTools 갱신, `edit:file_change` → filesChanged 중복 없이 추가, `edit:turn_complete` → status waiting_input, `edit:result` → status reviewing, `edit:error` → status error. 반환 API는 `sendMessage(msg)`(user 메시지 추가 후 `POST /edits/:editId/messages`), `interrupt()`(`POST /edits/:editId/interrupt`), `rewind(messageId, dryRun)`(`POST /edits/:editId/rewind`), `endConversation()`(`POST /edits/:editId/end`)이며 언마운트 시 `EventSource.close()` 한다. 네트워크 단절 시 EventSource가 자동 재연결하며 `Last-Event-ID` 헤더로 미수신 이벤트만 복원한다.
 
 ---
 
@@ -541,12 +597,12 @@ stateDiagram-v2
 
 | SDK 에러 | 처리 |
 |----------|------|
-| `error: 'rate_limit'` | `edit:error` + 재시도 안내 |
-| `error: 'server_error'` | `edit:error` + 재시도 안내 |
-| `error: 'authentication_failed'` | `edit:error` + API 키 확인 안내 |
-| `subtype: 'error_max_turns'` | `edit:result` + "최대 턴 수 초과" 안내 |
-| `subtype: 'error_max_budget_usd'` | `edit:result` + "비용 한도 초과" 안내 |
-| `subtype: 'error_during_execution'` | `edit:result` + 에러 메시지 표시 |
+| `error: 'rate_limit'` | SSE `edit:error` + 재시도 안내 |
+| `error: 'server_error'` | SSE `edit:error` + 재시도 안내 |
+| `error: 'authentication_failed'` | SSE `edit:error` + API 키 확인 안내 |
+| `subtype: 'error_max_turns'` | SSE `edit:result` + "최대 턴 수 초과" 안내 |
+| `subtype: 'error_max_budget_usd'` | SSE `edit:result` + "비용 한도 초과" 안내 |
+| `subtype: 'error_during_execution'` | SSE `edit:result` + 에러 메시지 표시 |
 | AbortController abort | 세션 종료 + 정리 |
 
 ---
